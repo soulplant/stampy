@@ -161,8 +161,8 @@ func main() {
 			setNewPassword(vault)
 			os.Exit(0)
 		}
-		if c.Args().First() == "" {
-			fmt.Println("usage:", app.UsageText)
+		if c.NArg() == 0 {
+			cli.ShowAppHelpAndExit(c, 0)
 			os.Exit(1)
 		}
 		loginIfNecessary(vault)
