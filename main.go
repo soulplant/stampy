@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"text/template"
 
@@ -61,12 +61,15 @@ func setNewPassword(vault *api.Client) {
 }
 
 // readSecret reads the 'value' field of the secret at the given path.
-func readSecret(vault *api.Client, path string) string {
+func readSecret(vault *api.Client, path string) (string, error) {
 	s, err := vault.Logical().Read(path)
 	if err != nil {
 		panic(err)
 	}
-	return s.Data["value"].(string)
+	if s == nil || s.Data == nil {
+		return "", errors.New("Couldn't read secret")
+	}
+	return s.Data["value"].(string), nil
 }
 
 // writeSecret writes the 'value' field of the secret at the given path.
@@ -86,100 +89,134 @@ func loginIfNecessary(vault *api.Client) {
 	}
 }
 
+// executeTemplate executes the template in the file tmplName, interpolating secrets into it.
+func executeTemplate(vault *api.Client, tmplName string) (string, error) {
+	secrets := make(map[string]string)
+	fails := make(map[string]error)
+	discoverSecrets := map[string]interface{}{
+		"secret": func(path string) string {
+			secrets[path] = ""
+			return ""
+		},
+	}
+
+	tmpl := template.New("")
+	// Execute the template to discover the secrets it references.
+	tmpl.Funcs(discoverSecrets)
+	if _, err := tmpl.ParseFiles(tmplName); err != nil {
+		return "", err
+	}
+	if err := tmpl.ExecuteTemplate(ioutil.Discard, tmplName, nil); err != nil {
+		return "", err
+	}
+
+	failed := false
+	for k, _ := range secrets {
+		val, err := readSecret(vault, "secret/"+k)
+		if err != nil {
+			fails[k] = err
+			failed = true
+			continue
+		}
+		secrets[k] = val
+	}
+	if failed {
+		var buf bytes.Buffer
+		fmt.Fprintln(&buf, "Failed to read all secrets:")
+		for k, _ := range fails {
+			fmt.Fprintf(&buf, "  Failed to read secret '%v'\n", k)
+		}
+		return "", errors.New(buf.String())
+	}
+
+	lookupSecrets := map[string]interface{}{
+		"secret": func(path string) string {
+			return secrets[path]
+		},
+	}
+	var buf bytes.Buffer
+	tmpl.Funcs(lookupSecrets)
+	tmpl.ParseFiles(tmplName)
+	tmpl.ExecuteTemplate(&buf, tmplName, nil)
+	return buf.String(), nil
+}
+
 func main() {
-	var loginFlag bool
-	var writeFlag bool
-	var passwordFlag bool
-	var address string
 	vaultAddr := os.Getenv("VAULT_ADDR")
 	if vaultAddr == "" {
 		vaultAddr = "https://127.0.0.1:8200"
 	}
-	app := cli.NewApp()
-	app.Usage = "stamps out golang templates with vault secrets in them"
-	app.UsageText = "stampy config.tmpl"
-	app.Version = "0.0.1"
-	app.ArgsUsage = "config.tmpl"
-	app.Flags = []cli.Flag{
-		cli.BoolFlag{
-			Name:        "login, l",
-			Usage:       "Just login and exit",
-			Destination: &loginFlag,
-		},
-		cli.StringFlag{
-			Name:        "address, a",
-			Usage:       "The address of the vault server",
-			Destination: &address,
-			Value:       vaultAddr,
-		},
-		cli.BoolFlag{
-			Name:        "write, w",
-			Usage:       "Write the value of a secret",
-			Destination: &writeFlag,
-		},
-		cli.BoolFlag{
-			Name:        "pw",
-			Usage:       "Change your password",
-			Destination: &passwordFlag,
-		},
+	vault, err := api.NewClient(&api.Config{
+		Address: vaultAddr,
+	})
+	if err != nil {
+		fmt.Println("Failed to connect to vault", err)
 	}
-	app.Action = func(c *cli.Context) error {
-		vault, err := api.NewClient(&api.Config{
-			Address: address,
-		})
-		if err != nil {
-			fmt.Println("Failed to connect to vault", err)
-		}
-		if loginFlag {
-			loginPrompt(vault)
-			os.Exit(0)
-		}
-		if writeFlag {
-			path := c.Args().First()
-			value := c.Args().Get(1)
-			if path == "" {
-				fmt.Println("usage: stampy -w path [value]")
-				os.Exit(1)
-			}
-			if value == "" {
-				value, err = speakeasy.Ask("Enter the secret (it will be hidden): ")
-				if err != nil {
-					panic(err)
+	app := cli.NewApp()
+	app.Name = "vaultage"
+	app.Usage = "a simple Vault CLI"
+	app.UsageText = "vaultage command [args...]"
+	app.Version = "0.0.1"
+	app.Commands = []cli.Command{
+		{
+			Name: "login",
+			Action: func(c *cli.Context) error {
+				loginPrompt(vault)
+				return nil
+			},
+		},
+		{
+			Name:      "write",
+			Usage:     "write or update a secret",
+			ArgsUsage: "path",
+			Action: func(c *cli.Context) error {
+				path := c.Args().Get(0)
+				value := c.Args().Get(1)
+				if path == "" {
+					fmt.Println("usage: vaultage write path [value]")
+					os.Exit(1)
 				}
-			}
-			loginIfNecessary(vault)
-			_, err := vault.Logical().Write(path, map[string]interface{}{
-				"value": value,
-			})
-			if err != nil {
-				log.Println("Failed to write secret:", err)
-			}
-			os.Exit(0)
-		}
-		if passwordFlag {
-			loginIfNecessary(vault)
-			setNewPassword(vault)
-			os.Exit(0)
-		}
-		if c.NArg() == 0 {
-			cli.ShowAppHelpAndExit(c, 0)
-			os.Exit(1)
-		}
-		loginIfNecessary(vault)
+				if value == "" {
+					value, err = speakeasy.Ask("Enter the secret (it will be hidden): ")
+					if err != nil {
+						return err
+					}
+				}
+				loginIfNecessary(vault)
+				err = writeSecret(vault, path, value)
+				if err != nil {
+					return err
+				}
+				return err
+			},
+		},
+		{
+			Name:      "set-password",
+			Usage:     "set your password",
+			ArgsUsage: " ",
+			Action: func(c *cli.Context) error {
+				loginIfNecessary(vault)
+				setNewPassword(vault)
+				return nil
+			},
+		},
+		{
+			Name:      "stamp",
+			Usage:     "write golang templates with Vault secrets interpolated",
+			ArgsUsage: "config.json.tmpl > config.tmpl",
+			Action: func(c *cli.Context) error {
+				loginIfNecessary(vault)
 
-		tmpl := template.New("").Funcs(
-			map[string]interface{}{
-				"secret": func(path string) string { return readSecret(vault, "secret/"+path) },
-			})
-		tmplName := c.Args().First()
-		t, err := tmpl.ParseFiles(tmplName)
-		if err != nil {
-			log.Fatal(err)
-		}
-		var buf bytes.Buffer
-		t.ExecuteTemplate(&buf, tmplName, nil)
-		fmt.Print(buf.String())
-		return nil
+				tmplName := c.Args().First()
+				text, err := executeTemplate(vault, tmplName)
+				if err != nil {
+					fmt.Println("Failed to execute template", err)
+					return err
+				}
+				fmt.Print(text)
+				return nil
+			},
+		},
 	}
 	app.Run(os.Args)
 }
