@@ -99,14 +99,18 @@ func executeTemplate(vault *api.Client, tmplName string) (string, error) {
 			return ""
 		},
 	}
+	tmplBytes, err := ioutil.ReadFile(tmplName)
+	if err != nil {
+		return "", err
+	}
 
 	tmpl := template.New("")
 	// Execute the template to discover the secrets it references.
 	tmpl.Funcs(discoverSecrets)
-	if _, err := tmpl.ParseFiles(tmplName); err != nil {
+	if _, err := tmpl.Parse(string(tmplBytes)); err != nil {
 		return "", err
 	}
-	if err := tmpl.ExecuteTemplate(ioutil.Discard, tmplName, nil); err != nil {
+	if err := tmpl.Execute(ioutil.Discard, nil); err != nil {
 		return "", err
 	}
 
@@ -136,8 +140,8 @@ func executeTemplate(vault *api.Client, tmplName string) (string, error) {
 	}
 	var buf bytes.Buffer
 	tmpl.Funcs(lookupSecrets)
-	tmpl.ParseFiles(tmplName)
-	tmpl.ExecuteTemplate(&buf, tmplName, nil)
+	tmpl.Parse(string(tmplBytes))
+	tmpl.Execute(&buf, nil)
 	return buf.String(), nil
 }
 
